@@ -1,35 +1,57 @@
 #!/bin/bash
 
-# --- Configuration ---
+set -e
+export AWS_PAGER=""
+
 APP_NAME="jewelry-app"
 ENV_NAME="jewelry-env"
-VERSION_LABEL="v1"
-S3_BUCKET="your-s3-bucket-name"
-ZIP_FILE="jewelry-dockerrun.zip"
+REGION="us-east-1"
+ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+ECR_URL="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME"
+S3_BUCKET="jewelry-shop-s3-bucket"
 
-# --- Confirm before proceeding ---
-read -p "⚠️ This will DELETE the Elastic Beanstalk environment and application. Continue? (y/n): " confirm
-if [[ "$confirm" != "y" ]]; then
-    echo "Aborted."
-    exit 1
+echo "🛑 Terminating Elastic Beanstalk environment: $ENV_NAME"
+aws elasticbeanstalk terminate-environment \
+  --environment-name "$ENV_NAME" \
+  --region "$REGION" || echo "Environment not found."
+
+echo "⏳ Waiting for environment to terminate..."
+aws elasticbeanstalk wait environment-terminated \
+  --environment-names "$ENV_NAME" \
+  --region "$REGION" || echo "Termination wait skipped."
+
+echo "🧨 Deleting Elastic Beanstalk application: $APP_NAME"
+aws elasticbeanstalk delete-application \
+  --application-name "$APP_NAME" \
+  --region "$REGION" \
+  --terminate-env-by-force || echo "Application may already be gone."
+
+echo "🗑️ Deleting Docker image from ECR..."
+IMAGE_DIGEST=$(aws ecr list-images \
+  --repository-name "$APP_NAME" \
+  --region "$REGION" \
+  --query 'imageIds[*].imageDigest' \
+  --output text)
+
+if [[ -n "$IMAGE_DIGEST" ]]; then
+  aws ecr batch-delete-image \
+    --repository-name "$APP_NAME" \
+    --image-ids imageDigest="$IMAGE_DIGEST" \
+    --region "$REGION"
 fi
 
-echo "⛔ Deleting Elastic Beanstalk environment: $ENV_NAME"
-aws elasticbeanstalk terminate-environment --environment-name "$ENV_NAME"
+echo "🧹 Deleting ECR repository: $APP_NAME"
+aws ecr delete-repository \
+  --repository-name "$APP_NAME" \
+  --region "$REGION" \
+  --force || echo "ECR repo may already be gone."
 
-echo "⌛ Waiting for environment termination..."
-aws elasticbeanstalk wait environment-terminated --environment-name "$ENV_NAME"
+echo "🧼 Deleting all contents in S3 bucket: $S3_BUCKET"
+aws s3 rm s3://$S3_BUCKET --recursive --region "$REGION" || echo "No files found."
 
-echo "🧼 Deleting application version: $VERSION_LABEL"
-aws elasticbeanstalk delete-application-version \
-    --application-name "$APP_NAME" \
-    --version-label "$VERSION_LABEL" \
-    --delete-source-bundle
+echo "🪣 Deleting the S3 bucket itself..."
+aws s3api delete-bucket \
+  --bucket "$S3_BUCKET" \
+  --region "$REGION" || echo "S3 bucket may already be deleted."
 
-echo "🗑️ Deleting application: $APP_NAME"
-aws elasticbeanstalk delete-application --application-name "$APP_NAME"
-
-echo "🧹 Cleaning up ZIP file from S3: $ZIP_FILE"
-aws s3 rm "s3://$S3_BUCKET/$ZIP_FILE"
-
-echo "✅ Cleanup complete."
+echo "✅ All AWS resources deleted successfully."
